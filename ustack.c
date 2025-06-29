@@ -34,6 +34,7 @@ static const struct rte_eth_conf port_conf_default = {
 /*这个宏定义了DPDK应用从RX队列中一次轮询尝试读取的最大数据包的数量*/
 #define BURST_SIZE     128  /*一次接收/发送的缓冲区数量，每次最多能进停车场的车辆数*/
 
+#if 0
 int main(int argc, char *argv[])
 {
     // 初始化DPDK环境
@@ -60,7 +61,7 @@ int main(int argc, char *argv[])
     *   mbuf_pool参数指定了内存池的名称，这个名称在后续的代码中可以用来引用这个内存池。
     *   cache_size参数指定了每个CPU核心的缓存大小，这个参数可以用来优化内存池的性能， 0表示禁用缓存。
     *   private_size参数指定了每个rte_mbuf结构体中私有数据的大小，这个参数可以用来存储一些额外的信息， 0表示禁用私有数据。
-    *   RTE_MBUF_DEFAULT_BUF_SIZE参数指定了每个缓冲区的默认大小（2048 + 128）字节
+    *   RTE_MBUF_DEFAULT_BUF_SIZE参数指定了每个缓冲区的默认大小（2048 + 128）字节，128位dpdk mbuf头部开销
     *   rte_socket_id()函数用于获取当前线程所在的NUMA节点，然后在该节点上分配内存池
     */
     struct rte_mempool *mbuf_pool = rte_pktmbuf_pool_create("mbufpool", NUM_MBUFS, 0/*cache size*/, 0/*private size*/, RTE_MBUF_DEFAULT_BUF_SIZE/*pkt_room_size*/, rte_socket_id()/* `rte_socket_id()` 来获取当前线程所在的NUMA节点，然后在该节点上分配内存池*/);
@@ -107,6 +108,15 @@ int main(int argc, char *argv[])
 +--------------+-------------+---------------------+---------------+
 |    ethhdr    |    iphdr    |    udphdr/tcphdr    |    payload    |
 +--------------+-------------+---------------------+---------------+
++---------------+---------------+------------------+---------------+
+| Ethernet Header|  IPv4 Header  |    UDP Header    |    Payload    |
++---------------+---------------+------------------+---------------+
+| 14 bytes      | 20 bytes      | 8 bytes          | N bytes       |
++---------------+---------------+------------------+---------------+
+^               ^               ^                  ^
+|               |               |                  |
+ehdr            iphdr           udphdr             payload
+(rte_pktmbuf_mtod) (rte_pktmbuf_mtod_offset) (iphdr+1)       (udphdr+1)
 */
         unsigned int i = 0;
         /*处理每个收到的包*/
@@ -137,3 +147,142 @@ int main(int argc, char *argv[])
 
     return 0;
 }
+#else
+typedef void (*packet_handler_fn)(struct rte_mbuf *mbuf);
+
+struct protocol_handler{
+    packet_handler_fn handler;
+};
+
+static void udp_handler_fun(struct rte_mbuf *mbuf)
+{
+    /*获取以太网头，rte_pktmbuf_mtod将mbuf转化为参数指定的数据结构*/
+    struct rte_ether_hdr *ehdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
+    /*检查是否为IPV4包*/
+    /*rte_cpu_to_be_16就是将16位主机字节序转换为网络字节序*/
+    if(ehdr->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)){
+        return;
+    }
+
+    /*rte_pktmbuf_mtod_offset是带偏移量的mbuf转换宏
+    *参数1：mbuf指针
+    *参数2：目标数据结构类型
+    *参数3：偏移量
+    */
+    struct rte_ipv4_hdr *iphdr = rte_pktmbuf_mtod_offset(mbuf, struct rte_ipv4_hdr *, sizeof(struct rte_ether_hdr));
+    /*next_proto_id：IP头中的协议类型字段（1字节）*/
+    if(iphdr->next_proto_id == IPPROTO_UDP){
+        struct rte_udp_hdr *udphdr = (struct rte_udp_hdr *)(iphdr + 1);/*跳过IP头，获取UDP头起始位置*/
+        uint16_t length = udphdr->dgram_len; /*获取UDP数据包长度*/
+        printf("length: %d, content: %s\n", length, (char *)(udphdr + 1)); /*获取UDP数据部分起始位置并打印*/
+    }
+}
+
+struct protocol_handler udp_handler = {
+    .handler = udp_handler_fun,
+};
+
+#define MAX_HANDLERS 10
+static struct protocol_handler *handlers[MAX_HANDLERS];
+static int handler_count = 0;
+
+void register_handler(struct protocol_handler *handler)
+{
+    if(handler_count < MAX_HANDLERS){
+        handlers[handler_count++] = handler;
+    }
+}
+
+void process_packet(struct rte_mbuf **mbufs, uint16_t num_packets)
+{
+    for(int i = 0; i < num_packets; i++){
+        for(int h = 0; h < handler_count; h++){
+            handlers[h]->handler(mbufs[i]);
+        }
+        rte_pktmbuf_free(mbufs[i]);
+    }
+}
+
+void init_dpdk(int argc, char*argv[])
+{
+    // 初始化DPDK环境
+    /*初始化Environment Abstraction Layer （EAL）*/
+    if(rte_eal_init(argc, argv) < 0){
+        rte_exit(EXIT_FAILURE, "Error with EAL init\n");
+    }
+
+    /*获取可用网卡数量*/
+    uint16_t nb_sys_ports = rte_eth_dev_count_avail();
+    if(nb_sys_ports == 0){
+        rte_exit(EXIT_FAILURE, "No support eth found\n");
+    }
+
+    printf("nb_sys_ports: %d\n", nb_sys_ports);
+
+    /*创建内存池*/
+    /*
+    *   rte_pktmbuf_pool_create()函数用于创建一个内存池，该内存池用于存储rte_mbuf结构体
+    *   rte_mbuf结构体是DPDK中用于描述数据包的缓冲区结构体，每个rte_mbuf结构体
+    *   都包含一个缓冲区指针，指向实际存储数据包的内存区域，以及一些用于管理
+    *   缓冲区的元数据，如缓冲区大小、缓冲区状态等。
+    *   数据缓冲区大小由data_room_size参数指定，默认为2048字节
+    *   mbuf_pool参数指定了内存池的名称，这个名称在后续的代码中可以用来引用这个内存池。
+    *   cache_size参数指定了每个CPU核心的缓存大小，这个参数可以用来优化内存池的性能， 0表示禁用缓存。
+    *   private_size参数指定了每个rte_mbuf结构体中私有数据的大小，这个参数可以用来存储一些额外的信息， 0表示禁用私有数据。
+    *   RTE_MBUF_DEFAULT_BUF_SIZE参数指定了每个缓冲区的默认大小（2048 + 128）字节，128位dpdk mbuf头部开销
+    *   rte_socket_id()函数用于获取当前线程所在的NUMA节点，然后在该节点上分配内存池
+    */
+    struct rte_mempool *mbuf_pool = rte_pktmbuf_pool_create("mbufpool", NUM_MBUFS, 0/*cache size*/, 0/*private size*/, RTE_MBUF_DEFAULT_BUF_SIZE/*pkt_room_size*/, rte_socket_id()/* `rte_socket_id()` 来获取当前线程所在的NUMA节点，然后在该节点上分配内存池*/);
+    if(!mbuf_pool){
+        rte_exit(EXIT_FAILURE, "Could not create mbuf_pool\n");
+    }
+
+    /*获取网卡信息*/
+    struct rte_eth_dev_info dev_info;
+    rte_eth_dev_info_get(g_dpdkd_port_id, &dev_info);
+
+    /*配置网卡*/
+    const int num_rx_queue = 1; /*网卡接收队列数量*/
+    const int num_tx_queue = 0; /*0个发送队列数量，纯接收应用*/
+    struct rte_eth_conf port_conf = port_conf_default; /*使用默认配置*/
+
+    /*配置网卡端口*/
+    if(rte_eth_dev_configure(g_dpdkd_port_id, num_rx_queue, num_tx_queue, &port_conf) < 0){
+        rte_exit(EXIT_FAILURE, "rte eth dev configure failed\n");
+    }
+
+    /*配置网卡接收队列*/
+    /*rte_eth_rx_queue_setup()函数用于配置网卡接收队列，该函数会为指定的网卡端口和接收队列分配内存，并设置接收队列的参数。*/
+    /*rte_eth_dev_socket_id(g_dpdkd_port_id)函数用于获取网卡所属的物理NUMA节点，然后在该节点上分配内存池*/
+    /*mbuf_pool参数指定了用于存储接收到的数据包的内存池，这个内存池是在前面创建的。*/
+    if(rte_eth_rx_queue_setup(g_dpdkd_port_id, 0/*rx id*/, 128, rte_eth_dev_socket_id(g_dpdkd_port_id)/*网卡所属物理NUMA节点*/, NULL/*接收配置*/, mbuf_pool) < 0){
+        rte_exit(EXIT_FAILURE, "Could not setup RX queue\n");
+    }
+
+    /*启动网卡*/
+    if(rte_eth_dev_start(g_dpdkd_port_id) < 0){
+        rte_exit(EXIT_FAILURE, "Could not start\n");
+    }
+}
+
+void init_application()
+{
+    register_handler(&udp_handler);
+}
+
+int main(int argc, char *argv[])
+{
+    init_dpdk(argc, argv);
+    init_application();
+    while(1){
+        struct rte_mbuf *mbufs[BURST_SIZE];
+         unsigned int nb_received = rte_eth_rx_burst(g_dpdkd_port_id, 0/*rx id队列0*/, mbufs, BURST_SIZE);
+        /*不应超过请求数量*/
+        if(nb_received > BURST_SIZE){
+            rte_exit(EXIT_FAILURE, "Error with rte_eth_rx burst\n");
+        }
+        process_packet(mbufs, nb_received);
+    }
+    return 0;
+}
+#endif
