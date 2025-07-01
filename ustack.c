@@ -148,7 +148,7 @@ ehdr            iphdr           udphdr             payload
     return 0;
 }
 #else
-typedef void (*packet_handler_fn)(struct rte_mempool *mbuf_pool, struct rte_mbuf *mbuf);
+typedef void (*packet_handler_fn)(struct rte_mempool **mbuf_pool, struct rte_mbuf *mbuf);
 
 struct protocol_handler{
     packet_handler_fn handler;
@@ -169,9 +169,10 @@ uint16_t g_dst_port;
 
 int ustack_encode_udp_pkt(uint8_t *msg, unsigned char *data, uint16_t length)
 {
+    printf("encode udp pkt\n");
     struct rte_ether_hdr *ehdr = (struct rte_ether_hdr *)msg;
-    rte_memcpy(ehdr->s_addr, g_src_mac, RTE_ETHER_ADDR_LEN);
-    rte_memcpy(ehdr->d_addr, g_dst_mac, RTE_ETHER_ADDR_LEN);
+    rte_memcpy(&ehdr->s_addr, g_src_mac, RTE_ETHER_ADDR_LEN);
+    rte_memcpy(&ehdr->d_addr, g_dst_mac, RTE_ETHER_ADDR_LEN);
     ehdr->ether_type = htons(RTE_ETHER_TYPE_IPV4);
 
     struct rte_ipv4_hdr *iphdr = (struct rte_ipv4_hdr *)(msg + sizeof(struct rte_ether_hdr));
@@ -198,10 +199,10 @@ int ustack_encode_udp_pkt(uint8_t *msg, unsigned char *data, uint16_t length)
     iphdr->fragment_offset = 0;
     iphdr->next_proto_id = IPPROTO_UDP;
     iphdr->time_to_live = 64;
-    iphdr->header_checksum = 0;
+    iphdr->hdr_checksum = 0;
     iphdr->dst_addr = g_dst_ip;
     iphdr->src_addr = g_src_ip;
-    iphdr->header_checksum = rte_ipv4_cksum(iphdr);
+    iphdr->hdr_checksum = rte_ipv4_cksum(iphdr);
 
     struct rte_udp_hdr *udphdr = (struct rte_udp_hdr *)(msg + sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr));
     udphdr->src_port = g_src_port;
@@ -215,8 +216,9 @@ int ustack_encode_udp_pkt(uint8_t *msg, unsigned char *data, uint16_t length)
     return length;
 }
 
-struct rte_mbuf* ustack_send(struct rte_mempool *mbuf_pool, unsigned char *data, uint16_t length)
+struct rte_mbuf* ustack_send(struct rte_mempool **mbuf_pool, unsigned char *data, uint16_t length)
 {
+    printf("ustack_send\n");
     const unsigned total_length = length + sizeof(struct rte_ether_hdr) + 
     sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr);
 
@@ -226,8 +228,8 @@ struct rte_mbuf* ustack_send(struct rte_mempool *mbuf_pool, unsigned char *data,
         rte_exit(EXIT_FAILURE, "rte pktmbuf alloc failed\n");
     }
 
-    mbuf.pkt_len = total_length;
-    mbuf.data_len = length;
+    mbuf->pkt_len = total_length;
+    mbuf->data_len = length;
 
     uint8_t *pktdata = rte_pktmbuf_mtod(mbuf, uint8_t*);
     ustack_encode_udp_pkt(pktdata, data, total_length);
@@ -235,7 +237,7 @@ struct rte_mbuf* ustack_send(struct rte_mempool *mbuf_pool, unsigned char *data,
     return mbuf;
 }
 
-static void udp_handler_fun(struct rte_mempool *mbuf_pool, struct rte_mbuf *mbuf)
+static void udp_handler_fun(struct rte_mempool **mbuf_pool, struct rte_mbuf *mbuf)
 {
     /*获取以太网头，rte_pktmbuf_mtod将mbuf转化为参数指定的数据结构*/
     struct rte_ether_hdr *ehdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
@@ -254,17 +256,17 @@ static void udp_handler_fun(struct rte_mempool *mbuf_pool, struct rte_mbuf *mbuf
     /*next_proto_id：IP头中的协议类型字段（1字节）*/
     if(iphdr->next_proto_id == IPPROTO_UDP){
         struct rte_udp_hdr *udphdr = (struct rte_udp_hdr *)(iphdr + 1);/*跳过IP头，获取UDP头起始位置*/
-        uint16_t length = udphdr->dgram_len; /*获取UDP数据包长度*/
-        printf("length: %d, content: %s\n", length, (char *)(udphdr + 1)); /*获取UDP数据部分起始位置并打印*/
+        uint16_t udp_length = udphdr->dgram_len; /*获取UDP数据包长度*/
+        printf("length: %d, content: %s\n", udp_length, (char *)(udphdr + 1)); /*获取UDP数据部分起始位置并打印*/
         /*这里length是网络字节序，实际数值为udp头8字节加数据长度*/
-        uint16_t length = ntohs(udphdr->dgram_len) - sizeof(struct rte_udp_hdr);
+        uint16_t length = ntohs(udp_length) - sizeof(struct rte_udp_hdr);
         
 #if ENABLE_SEND
         /*发送回包*/
-        rte_memcpy(g_dst_mac, ehdr->s_addr, RTE_ETHER_ADDR_LEN);
-        rte_memcpy(g_src_mac, ehdr->d_addr, RTE_ETHER_ADDR_LEN);
-        rte_memcpy(&g_dst_ip, iphdr->src_addr, sizeof(uint32_t));
-        rte_memcpy(&g_src_ip, iphdr->dst_addr, sizeof(uint32_t));
+        rte_memcpy(g_dst_mac, &ehdr->s_addr, RTE_ETHER_ADDR_LEN);
+        rte_memcpy(g_src_mac, &ehdr->d_addr, RTE_ETHER_ADDR_LEN);
+        rte_memcpy(&g_dst_ip, &iphdr->src_addr, sizeof(uint32_t));
+        rte_memcpy(&g_src_ip, &iphdr->dst_addr, sizeof(uint32_t));
         rte_memcpy(&g_dst_port, &udphdr->dst_port, sizeof(uint16_t));
         rte_memcpy(&g_src_port, &udphdr->src_port, sizeof(uint16_t));
         ustack_send(mbuf_pool, (char *)(udphdr + 1), length);
@@ -289,7 +291,7 @@ void register_handler(struct protocol_handler *handler)
     }
 }
 
-void process_packet(struct rte_mempool *mbuf_pool, struct rte_mbuf **mbufs, uint16_t num_packets)
+void process_packet(struct rte_mempool **mbuf_pool, struct rte_mbuf **mbufs, uint16_t num_packets)
 {
     for(int i = 0; i < num_packets; i++){
         for(int h = 0; h < handler_count; h++){
@@ -329,8 +331,10 @@ void init_dpdk(int argc, char*argv[], struct rte_mempool **mbuf_pool)
     *   rte_socket_id()函数用于获取当前线程所在的NUMA节点，然后在该节点上分配内存池
     */
     *mbuf_pool = rte_pktmbuf_pool_create("mbufpool", NUM_MBUFS, 0/*cache size*/, 0/*private size*/, RTE_MBUF_DEFAULT_BUF_SIZE/*pkt_room_size*/, rte_socket_id()/* `rte_socket_id()` 来获取当前线程所在的NUMA节点，然后在该节点上分配内存池*/);
-    if(!mbuf_pool){
+    if(!*mbuf_pool){
         rte_exit(EXIT_FAILURE, "Could not create mbuf_pool\n");
+    }else{
+        printf("mbuf pool created\n");
     }
 
     /*获取网卡信息*/
@@ -345,19 +349,25 @@ void init_dpdk(int argc, char*argv[], struct rte_mempool **mbuf_pool)
     /*配置网卡端口*/
     if(rte_eth_dev_configure(g_dpdkd_port_id, num_rx_queue, num_tx_queue, &port_conf) < 0){
         rte_exit(EXIT_FAILURE, "rte eth dev configure failed\n");
+    }else{
+        printf("rte eth dev configure success\n");
     }
 
     /*配置网卡接收队列*/
     /*rte_eth_rx_queue_setup()函数用于配置网卡接收队列，该函数会为指定的网卡端口和接收队列分配内存，并设置接收队列的参数。*/
     /*rte_eth_dev_socket_id(g_dpdkd_port_id)函数用于获取网卡所属的物理NUMA节点，然后在该节点上分配内存池*/
     /*mbuf_pool参数指定了用于存储接收到的数据包的内存池，这个内存池是在前面创建的。*/
-    if(rte_eth_rx_queue_setup(g_dpdkd_port_id, 0/*rx id*/, 128, rte_eth_dev_socket_id(g_dpdkd_port_id)/*网卡所属物理NUMA节点*/, NULL/*接收配置*/, mbuf_pool) < 0){
+    if(rte_eth_rx_queue_setup(g_dpdkd_port_id, 0/*rx id*/, 128, rte_eth_dev_socket_id(g_dpdkd_port_id)/*网卡所属物理NUMA节点*/, NULL/*接收配置*/, *mbuf_pool) < 0){
         rte_exit(EXIT_FAILURE, "Could not setup RX queue\n");
+    }else{
+        printf("rx queue setup success\n");
     }
 
     /*启动网卡*/
     if(rte_eth_dev_start(g_dpdkd_port_id) < 0){
         rte_exit(EXIT_FAILURE, "Could not start\n");
+    }else{
+        printf("eth dev start success\n");
     }
 }
 
@@ -384,7 +394,7 @@ int main(int argc, char *argv[])
         if(nb_received > BURST_SIZE){
             rte_exit(EXIT_FAILURE, "Error with rte_eth_rx burst\n");
         }
-        process_packet(mbuf_pool, mbufs, nb_received);
+        process_packet(&mbuf_pool, mbufs, nb_received);
     }
     return 0;
 }
