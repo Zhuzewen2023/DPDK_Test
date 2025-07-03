@@ -8,8 +8,9 @@
 int g_dpdkd_port_id = 0; /*默认使用网卡端口0，端口0代表系统中的第一个可用网卡，
                             DPDK为每个绑定的网卡分配从0开始的连续ID*/
 static const struct rte_eth_conf port_conf_default = { 
-    .rxmode = {.max_rx_pkt_len = RTE_ETHER_MAX_LEN} /*设置最大接受包长度
+    .rxmode = {.max_rx_pkt_len = RTE_ETHER_MAX_LEN}, /*设置最大接受包长度
                                                         1518字节，标准以太网帧*/
+    .txmode = {.offloads = 0, /*默认禁用所有卸载*/}  
 };
 /*
 +-----------------+--------------+---------------+--------------------+-------------+
@@ -219,7 +220,7 @@ int ustack_encode_udp_pkt(uint8_t *msg, unsigned char *data, uint16_t length)
 struct rte_mbuf* ustack_send(struct rte_mempool **mbuf_pool, unsigned char *data, uint16_t length)
 {
     printf("ustack_send\n");
-    const unsigned total_length = length + sizeof(struct rte_ether_hdr) + 
+    const uint16_t total_length = length + sizeof(struct rte_ether_hdr) + 
     sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr);
 
     struct rte_mbuf *mbuf = rte_pktmbuf_alloc(*mbuf_pool);
@@ -229,7 +230,7 @@ struct rte_mbuf* ustack_send(struct rte_mempool **mbuf_pool, unsigned char *data
     }
 
     mbuf->pkt_len = total_length;
-    mbuf->data_len = length;
+    mbuf->data_len = total_length;
 
     uint8_t *pktdata = rte_pktmbuf_mtod(mbuf, uint8_t*);
     ustack_encode_udp_pkt(pktdata, data, total_length);
@@ -257,19 +258,31 @@ static void udp_handler_fun(struct rte_mempool **mbuf_pool, struct rte_mbuf *mbu
     if(iphdr->next_proto_id == IPPROTO_UDP){
         struct rte_udp_hdr *udphdr = (struct rte_udp_hdr *)(iphdr + 1);/*跳过IP头，获取UDP头起始位置*/
         uint16_t udp_length = udphdr->dgram_len; /*获取UDP数据包长度*/
-        printf("length: %d, content: %s\n", udp_length, (char *)(udphdr + 1)); /*获取UDP数据部分起始位置并打印*/
         /*这里length是网络字节序，实际数值为udp头8字节加数据长度*/
         uint16_t length = ntohs(udp_length) - sizeof(struct rte_udp_hdr);
+        if(length > 0){
+            printf("length: %d, content: %s\n", length, (char *)(udphdr + 1)); /*获取UDP数据部分起始位置并打印*/
+        }
         
 #if ENABLE_SEND
         /*发送回包*/
         rte_memcpy(g_dst_mac, &ehdr->s_addr, RTE_ETHER_ADDR_LEN);
         rte_memcpy(g_src_mac, &ehdr->d_addr, RTE_ETHER_ADDR_LEN);
-        rte_memcpy(&g_dst_ip, &iphdr->src_addr, sizeof(uint32_t));
-        rte_memcpy(&g_src_ip, &iphdr->dst_addr, sizeof(uint32_t));
-        rte_memcpy(&g_dst_port, &udphdr->dst_port, sizeof(uint16_t));
-        rte_memcpy(&g_src_port, &udphdr->src_port, sizeof(uint16_t));
-        ustack_send(mbuf_pool, (char *)(udphdr + 1), length);
+        // rte_memcpy(&g_dst_ip, &iphdr->src_addr, sizeof(uint32_t));
+        // rte_memcpy(&g_src_ip, &iphdr->dst_addr, sizeof(uint32_t));
+        // rte_memcpy(&g_dst_port, &udphdr->dst_port, sizeof(uint16_t));
+        // rte_memcpy(&g_src_port, &udphdr->src_port, sizeof(uint16_t));
+        g_dst_ip = iphdr->src_addr;
+        g_src_ip = iphdr->dst_addr;
+        g_dst_port = udphdr->src_port;
+        g_src_port = udphdr->dst_port;
+        struct rte_mbuf *txbuf = ustack_send(mbuf_pool, (char *)(udphdr + 1), length);
+        if(txbuf){
+            if(rte_eth_tx_burst(g_dpdkd_port_id, 0, &txbuf, 1) < 1){
+                rte_pktmbuf_free(txbuf);
+            }
+        }
+        // rte_pktmbuf_free(txbuf);
         
 #endif
     
@@ -297,7 +310,7 @@ void process_packet(struct rte_mempool **mbuf_pool, struct rte_mbuf **mbufs, uin
         for(int h = 0; h < handler_count; h++){
             handlers[h]->handler(mbuf_pool, mbufs[i]);
         }
-        rte_pktmbuf_free(mbufs[i]);
+        // rte_pktmbuf_free(mbufs[i]);
     }
 }
 
@@ -343,7 +356,7 @@ void init_dpdk(int argc, char*argv[], struct rte_mempool **mbuf_pool)
 
     /*配置网卡*/
     const int num_rx_queue = 1; /*网卡接收队列数量*/
-    const int num_tx_queue = 0; /*0个发送队列数量，纯接收应用*/
+    const int num_tx_queue = 1; /*0个发送队列数量*/
     struct rte_eth_conf port_conf = port_conf_default; /*使用默认配置*/
 
     /*配置网卡端口*/
@@ -363,6 +376,17 @@ void init_dpdk(int argc, char*argv[], struct rte_mempool **mbuf_pool)
         printf("rx queue setup success\n");
     }
 
+    #if ENABLE_SEND
+    /*配置网卡发送队列*/
+    struct rte_eth_txconf txconf = dev_info.default_txconf; //采用网卡默认的发送队列配置
+    // txconf.offloads = port_conf.txmode.offloads; /*卸载特性：就是网卡代替CPU做的一些工作，比如IPV4头部校验和计算，TCP校验和计算，UDP校验和计算等*/
+    if(rte_eth_tx_queue_setup(g_dpdkd_port_id, 0/*tx id*/, 512, rte_eth_dev_socket_id(g_dpdkd_port_id)/*网卡所属物理NUMA节点*/, &txconf/*发送配置*/) < 0){
+        rte_exit(EXIT_FAILURE, "Could not setup TX queue\n");
+    }else{
+        printf("tx queue setup success\n");
+    }
+
+    #endif
     /*启动网卡*/
     if(rte_eth_dev_start(g_dpdkd_port_id) < 0){
         rte_exit(EXIT_FAILURE, "Could not start\n");
